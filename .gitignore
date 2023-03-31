@@ -1,0 +1,4 @@
+log/
+processed/
+nohup.out
+*pycache*
