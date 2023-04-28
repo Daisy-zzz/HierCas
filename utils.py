@@ -1,5 +1,10 @@
 import numpy as np
 
+def shuffle_within_group(group):
+    n = len(group)
+    perm = np.random.permutation(n)
+    return group.iloc[perm]
+
 ### Utility function and class
 class EarlyStopMonitor(object):
     def __init__(self, max_round=3, higher_better=True, tolerance=1e-3):

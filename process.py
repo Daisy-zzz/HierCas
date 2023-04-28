@@ -19,11 +19,12 @@ def preprocess_weibo(data_name, cut_time):
         entry = line.strip().split('\t')
         assert len(entry) == 5
         casid = int(entry[0])
+        print(casid)
         pub_uid = int(entry[1])
         pub_ts = int(entry[2])
         # 只选择8-18点之间发布的帖子
         hour = int(time.strftime("%H",time.localtime(pub_ts)))
-        if hour <= 7 or hour >= 19 :
+        if hour < 8 or hour >= 18:
             continue
         label = int(entry[3])
         paths = entry[4].split(' ')
@@ -42,6 +43,8 @@ def preprocess_weibo(data_name, cut_time):
                 break
             else:
                 count_path += 1
+            if count_path > 100:
+                break
             unobserved_flag = False
             if '/' not in p_entry[0]:
                 continue
@@ -66,18 +69,16 @@ def preprocess_weibo(data_name, cut_time):
                 # if len(node_arr) > 2:
                 #     print(casid)
         # 删除观测数量小于10或大于1000的级联
-        if count_path < 10 or count_path > 1000:
-            # print(casid, count_path)
+        if count_path < 10:
             continue
-        else:
-            assert len(cas_list_tmp) >= count_path - 1
-            cas_list.extend(cas_list_tmp)
-            src_list.extend(src_list_tmp)
-            target_list.extend(target_list_tmp)
-            ts_list.extend(ts_list_tmp)
-            label_list.extend(label_list_tmp)
-            size_list.extend(size_list_tmp)
-            cas_num += 1
+
+        cas_list.extend(cas_list_tmp)
+        src_list.extend(src_list_tmp)
+        target_list.extend(target_list_tmp)
+        ts_list.extend(ts_list_tmp)
+        label_list.extend(label_list_tmp)
+        size_list.extend(size_list_tmp)
+        cas_num += 1
     f.close()
     print('cas num: ', cas_num)
     return pd.DataFrame({'cas': cas_list,
@@ -91,8 +92,8 @@ def preprocess_weibo(data_name, cut_time):
 
 def run(data_name, cut_time):    
     PATH = '/root/shm/zzz_dataset/{}.txt'.format(data_name)
-    OUT_DF = './processed/ml_{}_{}.csv'.format(data_name, cut_time)
+    OUT_DF = './processed/ml_{}_{}_18.csv'.format(data_name, cut_time)
     df = preprocess_weibo(PATH, cut_time)
     df.to_csv(OUT_DF)
 
-run('weibo', 10800)
+run('weibo', 3600)

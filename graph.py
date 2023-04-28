@@ -6,12 +6,14 @@ class NeighborFinder:
         """
         Params
         ------
+        cas_dict: Dict{'cas_id': [start, end]}
         node_idx_l: List[int]
         node_ts_l: List[int]
         off_set_l: List[int], such that node_idx_l[off_set_l[i]:off_set_l[i + 1]] = adjacent_list[i]
         """ 
        
-        node_idx_l, node_ts_l, edge_idx_l, off_set_l = self.init_off_set(adj_list)
+        cas_l, node_idx_l, node_ts_l, edge_idx_l, off_set_l = self.init_off_set(adj_list)
+        self.cas_l = cas_l
         self.node_idx_l = node_idx_l
         self.node_ts_l = node_ts_l
         self.edge_idx_l = edge_idx_l
@@ -27,17 +29,21 @@ class NeighborFinder:
         adj_list: List[List[int]]
         
         """
+        cas_l = []
         n_idx_l = []
         n_ts_l = []
         e_idx_l = []
         off_set_l = [0]
+        # i is idx
         for i in range(len(adj_list)):
             curr = adj_list[i]
-            curr = sorted(curr, key=lambda x: x[1])
-            n_idx_l.extend([x[0] for x in curr])
-            e_idx_l.extend([x[1] for x in curr])
-            n_ts_l.extend([x[2] for x in curr])
+            #curr = sorted(curr, key=lambda x: x[2])
+            cas_l.extend([x[0] for x in curr])
+            n_idx_l.extend([x[1] for x in curr])
+            e_idx_l.extend([x[2] for x in curr])
+            n_ts_l.extend([x[3] for x in curr])
             off_set_l.append(len(n_idx_l))
+        cas_l = np.array(cas_l)
         n_idx_l = np.array(n_idx_l)
         n_ts_l = np.array(n_ts_l)
         e_idx_l = np.array(e_idx_l)
@@ -46,9 +52,9 @@ class NeighborFinder:
         assert(len(n_idx_l) == len(n_ts_l))
         assert(off_set_l[-1] == len(n_ts_l))
         
-        return n_idx_l, n_ts_l, e_idx_l, off_set_l
+        return cas_l, n_idx_l, n_ts_l, e_idx_l, off_set_l
         
-    def find_before(self, src_idx, cut_time):
+    def find_before(self, cas_id, src_idx, cut_time):
         """
     
         Params
@@ -56,14 +62,16 @@ class NeighborFinder:
         src_idx: int
         cut_time: float
         """
+        cas_l = self.cas_l
         node_idx_l = self.node_idx_l
         node_ts_l = self.node_ts_l
         edge_idx_l = self.edge_idx_l
         off_set_l = self.off_set_l
-        
-        neighbors_idx = node_idx_l[off_set_l[src_idx]:off_set_l[src_idx + 1]]
-        neighbors_ts = node_ts_l[off_set_l[src_idx]:off_set_l[src_idx + 1]]
-        neighbors_e_idx = edge_idx_l[off_set_l[src_idx]:off_set_l[src_idx + 1]]
+        neighbors_cas = cas_l[off_set_l[src_idx]:off_set_l[src_idx + 1]]
+        cas_idx = np.where(neighbors_cas == cas_id)
+        neighbors_idx = node_idx_l[off_set_l[src_idx]:off_set_l[src_idx + 1]][cas_idx]
+        neighbors_ts = node_ts_l[off_set_l[src_idx]:off_set_l[src_idx + 1]][cas_idx]
+        neighbors_e_idx = edge_idx_l[off_set_l[src_idx]:off_set_l[src_idx + 1]][cas_idx]
         
         if len(neighbors_idx) == 0 or len(neighbors_ts) == 0:
             return neighbors_idx, neighbors_ts, neighbors_e_idx
@@ -79,12 +87,13 @@ class NeighborFinder:
             else:
                 right = mid
                 
-        if neighbors_ts[right] < cut_time:
-            return neighbors_idx[:right], neighbors_e_idx[:right], neighbors_ts[:right]
+        if neighbors_ts[right] <= cut_time:
+            return neighbors_idx[:right+1], neighbors_e_idx[:right+1], neighbors_ts[:right+1]
         else:
-            return neighbors_idx[:left], neighbors_e_idx[:left], neighbors_ts[:left]
+            return neighbors_idx[:left+1], neighbors_e_idx[:left+1], neighbors_ts[:left+1]
 
-    def get_temporal_neighbor(self, src_idx_l, cut_time_l, num_neighbors=20):
+
+    def get_temporal_neighbor(self, cas_l, src_idx_l, cut_time_l, num_neighbors=20):
         """
         Params
         ------
@@ -93,14 +102,11 @@ class NeighborFinder:
         num_neighbors: int
         """
         assert(len(src_idx_l) == len(cut_time_l))
-        
         out_ngh_node_batch = np.zeros((len(src_idx_l), num_neighbors)).astype(np.int32)
         out_ngh_t_batch = np.zeros((len(src_idx_l), num_neighbors)).astype(np.float32)
         out_ngh_eidx_batch = np.zeros((len(src_idx_l), num_neighbors)).astype(np.int32)
-        
-        for i, (src_idx, cut_time) in enumerate(zip(src_idx_l, cut_time_l)):
-            ngh_idx, ngh_eidx, ngh_ts = self.find_before(src_idx, cut_time)
-
+        for i, (cas_id, src_idx, cut_time) in enumerate(zip(cas_l, src_idx_l, cut_time_l)):
+            ngh_idx, ngh_eidx, ngh_ts = self.find_before(cas_id, src_idx, cut_time)
             if len(ngh_idx) > 0:
                 if self.uniform:
                     sampled_idx = np.random.randint(0, len(ngh_idx), num_neighbors)

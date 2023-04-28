@@ -2,7 +2,7 @@ import logging
 
 import numpy as np
 import torch
-
+import math
 import torch.nn as nn
 import torch.nn.functional as F
 
@@ -37,7 +37,6 @@ class ScaledDotProductAttention(torch.nn.Module):
 
         attn = torch.bmm(q, k.transpose(1, 2))
         attn = attn / self.temperature
-
         if mask is not None:
             attn = attn.masked_fill(mask, -1e10)
 
@@ -92,8 +91,11 @@ class MultiHeadAttention(nn.Module):
         q = q.permute(2, 0, 1, 3).contiguous().view(-1, len_q, d_k) # (n*b) x lq x dk
         k = k.permute(2, 0, 1, 3).contiguous().view(-1, len_k, d_k) # (n*b) x lk x dk
         v = v.permute(2, 0, 1, 3).contiguous().view(-1, len_v, d_v) # (n*b) x lv x dv
+        if mask is not None:
+            mask = mask.repeat(n_head, 1, 1) # (n*b) x .. x ..
+        # k = k * decay
+        # v = v * decay
 
-        mask = mask.repeat(n_head, 1, 1) # (n*b) x .. x ..
         output, attn = self.attention(q, k, v, mask=mask)
 
         output = output.view(n_head, sz_b, len_q, d_v)
@@ -202,23 +204,32 @@ class TimeEncode(torch.nn.Module):
         time_dim = expand_dim
         self.factor = factor
         # 生成初始的维度为timedim的频率系数w，以及偏差，转为nn.Parameter在后续可被优化
+        
         self.basis_freq = torch.nn.Parameter((torch.from_numpy(1 / 10 ** np.linspace(0, 9, time_dim))).float())
         self.phase = torch.nn.Parameter(torch.zeros(time_dim).float())
+        self.time_decay = torch.nn.Parameter(torch.ones(time_dim).float())
         
-        #self.dense = torch.nn.Linear(time_dim, expand_dim, bias=False)
-
-        #torch.nn.init.xavier_normal_(self.dense.weight)
         
-    def forward(self, ts):
+    def forward(self, ts, time_decay=False):
         # ts: [N, L]
         batch_size = ts.size(0)
         seq_len = ts.size(1)
                 
         ts = ts.view(batch_size, seq_len, 1)# [N, L, 1]
+        ##
+        if time_decay:
+            ts = ts * self.time_decay.view(1, 1, -1)
+        ##
         map_ts = ts * self.basis_freq.view(1, 1, -1) # [N, L, time_dim]
         map_ts += self.phase.view(1, 1, -1)
-        
+
         harmonic = torch.cos(map_ts)
+
+        
+        # if time_decay:
+        #     # freq_decay = torch.cos(2 * math.pi * self.basis_freq * self.time_decay)
+        #     freq_decay = self.time_decay
+        #     harmonic = harmonic * freq_decay.view(1, 1, -1)
 
         return harmonic #self.dense(harmonic)
     
@@ -347,7 +358,7 @@ class AttnModel(torch.nn.Module):
             raise ValueError('attn_mode can only be prod or map')
         
         
-    def forward(self, src, src_t, seq, seq_t, seq_e, mask):
+    def forward(self, src, src_t, src_s, seq, seq_t, seq_e, mask):
         """"Attention based temporal attention forward pass
         args:
           src: float Tensor of shape [B, D]
@@ -365,12 +376,16 @@ class AttnModel(torch.nn.Module):
         """
 
         src_ext = torch.unsqueeze(src, dim=1) # src [B, 1, D]
-        src_e_ph = torch.zeros_like(src_ext)
-        q = torch.cat([src_ext, seq_e.mean(dim=1, keepdim=True), src_t], dim=2) # [B, 1, D + De + Dt] -> [B, 1, D]
+        #src_e_ph = torch.zeros_like(src_ext) 
+        src_e_ph = torch.unsqueeze(src_s, dim=1)
+        # seq_e.min(dim=1, keepdim=True)
+        q = torch.cat([src_ext, src_e_ph, src_t], dim=2) # [B, 1, D + De + Dt] -> [B, 1, D]
         k = torch.cat([seq, seq_e, seq_t], dim=2) # [B, N, D + De + Dt] -> [B, N, D]
         
         mask = torch.unsqueeze(mask, dim=2) # mask [B, N, 1]
         mask = mask.permute([0, 2, 1]) #mask [B, 1, N]
+
+        #decay = decay.permute([0, 2, 1]) #decay [B, 1, N]
 
         # # target-attention
         output, attn = self.multi_head_target(q=q, k=k, v=k, mask=mask) # output: [B, 1, D + Dt], attn: [B, 1, N]
@@ -381,12 +396,100 @@ class AttnModel(torch.nn.Module):
         return output, attn
 
 
+class ConvPool(nn.Module):
+    def __init__(self, in_channels, out_channels, feat_dim, n_head):
+        super(ConvPool, self).__init__()
+        self.conv = nn.Conv1d(in_channels=in_channels, out_channels=out_channels, kernel_size=5, stride=1)
+        # self.attention = MultiHeadAttention(n_head, 
+        #                                      d_model=feat_dim, 
+        #                                      d_k=feat_dim // n_head, 
+        #                                      d_v=feat_dim // n_head, 
+        #                                      dropout=0.1)
+        self.attention = nn.MultiheadAttention(feat_dim, n_head, dropout=0.1)
+
+    def forward(self, x):
+        # x shape: [num_nodes, dim]
+        x = x.unsqueeze(0).transpose(1, 2) # [1, dim, num_nodes]
+        x = self.conv(x).transpose(1, 2) # [1, num_nodes, out_channels]
+        x = F.relu(x)
+        attn_output, attn_output_weights = self.attention(x, x, x)
+        attn_output = attn_output + x
+        attn_output = torch.mean(attn_output, dim=1)
+        return attn_output
+    
+class ConvLSTMPool(nn.Module):
+    def __init__(self, feat_dim, device, n_head):
+        super(ConvLSTMPool, self).__init__()
+        self.conv = nn.Conv1d(in_channels=feat_dim, out_channels=feat_dim, kernel_size=5, stride=1)
+        self.attention = nn.MultiheadAttention(feat_dim, n_head, dropout=0.1)
+        self.lstm = torch.nn.LSTM(input_size=feat_dim, 
+                                  hidden_size=feat_dim, 
+                                  num_layers=1, 
+                                  batch_first=True)
+        self.device = device
+    
+    def forward(self, x):
+        # x shape: [num_nodes, dim]
+        x = x.unsqueeze(0).transpose(1, 2) # [1, dim, num_nodes]
+        x = self.conv(x)  # [1, out_channels, num_nodes]
+        x = x.transpose(1, 2) # [1, num_nodes, out_channels]
+        x = F.relu(x)
+        attn_output, attn_output_weights = self.attention(x, x, x)
+        attn_output = attn_output + x
+        #pad_x = nn.utils.rnn.pack_padded_sequence(x, 100, batch_first=True, enforce_sorted=False).to(self.device)
+        _, (hn, _) = self.lstm(attn_output)
+        hn = hn.squeeze(0)
+        # unpad_h = nn.utils.rnn.pad_packed_sequence(hn, batch_first=True)
+        return hn
+    
+# class global_attention(nn.Module):
+#     def __init__(self, in_features, hidden_dim):
+#         super(global_attention, self).__init__()
+#         self.linear1 = nn.Linear(in_features, hidden_dim)
+#         self.linear2 = nn.Linear(hidden_dim, 1)
+
+#     def forward(self, x):
+#         # x shape: [batch_size, num_nodes, in_features]
+#         #energy = self.linear2(F.relu(self.linear1(x))) # [batch_size, num_nodes, 1]
+#         energy = self.linear2(x)
+#         alpha = F.softmax(energy, dim=1) # [batch_size, num_nodes, 1]
+#         attended_x = torch.sum(alpha * x, dim=1) # [batch_size, in_features]
+#         return attended_x
+
+# class ConvPool(nn.Module):
+#     def __init__(self, in_channels, out_channels, feat_dim, num_heads):
+#         super(ConvPool, self).__init__()
+#         self.conv = nn.Conv1d(in_channels=in_channels, out_channels=out_channels, kernel_size=5, stride=1)
+#         # self.conv_attention = global_attention(feat_dim, feat_dim)
+#         #self.out_attention = global_attention(feat_dim, feat_dim)
+#         self.multihead_attention = nn.MultiheadAttention(feat_dim, num_heads, batch_first=True)
+        
+#     def forward(self, x):
+#         # x shape: [num_nodes, dim]
+#         x = x.unsqueeze(0).transpose(1, 2) # [1, dim, num_nodes]
+#         x = self.conv(x)  # [1, out_channels, num_nodes]
+#         x = x.transpose(1, 2) # [1, num_nodes, out_channels]
+#         x = F.relu(x)
+#         #x = x.unsqueeze(0)
+        
+#         #x, _ = self.multihead_attention(x, x, x)
+#         #x = x.mean(dim=1)
+#         x = self.out_attention(x)
+#         # Apply attention over the kernel-level windows
+#         # x = x.unfold(1, self.conv.kernel_size[0], 1).squeeze(0)  # [num_nodes, out_channels, kernel_size]
+#         # x = x.transpose(1, 2) # [num_nodes, kernel_size, out_channels]
+#         # x = self.conv_attention(x).unsqueeze(0)  # [1, num_nodes, out_channels]
+#         # x = self.out_attention(x) # [1, out_channels]
+#         return x
+
+    
 class TGAN(torch.nn.Module):
     def __init__(self, ngh_finder, node_num, edge_num, feat_dim, device,
                  attn_mode='prod', use_time='time', agg_method='attn',
-                 num_layers=3, n_head=4, null_idx=0, num_heads=1, drop_out=0.1, seq_len=None):
+                 num_layers=3, n_head=4, null_idx=0, num_heads=1, drop_out=0.1, decay=-1, seq_len=None):
         super(TGAN, self).__init__()
-        
+        #self.conv_pool = ConvPool(feat_dim, feat_dim, feat_dim, num_heads)
+        self.conv_pool = ConvLSTMPool(feat_dim, device, num_heads)
         self.node_num = node_num
         self.edge_num = edge_num
         self.feat_dim = feat_dim
@@ -395,19 +498,36 @@ class TGAN(torch.nn.Module):
         self.null_idx = null_idx
         self.device = device
         self.logger = logging.getLogger(__name__)
-        # self.n_feat_th = torch.nn.Parameter(torch.from_numpy(n_feat.astype(np.float32)))
-        # self.e_feat_th = torch.nn.Parameter(torch.from_numpy(e_feat.astype(np.float32)))
-        # self.edge_raw_embed = torch.nn.Embedding.from_pretrained(self.e_feat_th, padding_idx=0, freeze=True)
-        # self.node_raw_embed = torch.nn.Embedding.from_pretrained(self.n_feat_th, padding_idx=0, freeze=True)
+       
         self.n_feat_dim = self.feat_dim
         self.e_feat_dim = self.feat_dim
         self.model_dim = self.feat_dim
 
-        self.node_embed = torch.nn.Embedding(self.node_num, self.n_feat_dim)
-        self.edge_embed = torch.nn.Embedding(self.edge_num, self.e_feat_dim)
+        self.node_embed = nn.Sequential(
+            nn.Embedding(self.node_num, self.n_feat_dim),
+            nn.Dropout(drop_out)
+        )
+
+        self.edge_embed = nn.Sequential(
+            torch.nn.Embedding(self.edge_num, self.e_feat_dim),
+            nn.Dropout(drop_out)
+        )
+
         self.use_time = use_time
         self.merge_layer = MergeLayer(self.feat_dim, self.feat_dim, self.feat_dim, self.feat_dim)
-        
+        self.decay_param = torch.nn.Parameter(torch.tensor(decay).float())
+        self.output = nn.Linear(self.feat_dim, 1)
+        self.attlinear = nn.Linear(self.feat_dim, 1)
+        self.fuse = nn.Sequential(
+            nn.Linear(self.feat_dim * 2, self.feat_dim),
+            nn.ReLU()
+        )
+        nn.init.xavier_normal_(self.attlinear.weight)
+        nn.init.xavier_normal_(self.fuse[0].weight)
+        nn.init.xavier_normal_(self.node_embed[0].weight)
+        nn.init.xavier_normal_(self.edge_embed[0].weight)
+        nn.init.xavier_normal_(self.output.weight)
+
         if agg_method == 'attn':
             self.logger.info('Aggregation uses attention model')
             self.attn_model_list = torch.nn.ModuleList([AttnModel(self.feat_dim, 
@@ -444,31 +564,92 @@ class TGAN(torch.nn.Module):
             raise ValueError('invalid time option!')
         
         self.affinity_score = MergeLayer(self.feat_dim, self.feat_dim, self.feat_dim, 1) # torch.nn.Bilinear(self.feat_dim, self.feat_dim, 1, bias=True)
-        
-    def forward(self, cas_l, src_idx_l, target_idx_l, cut_time_l, num_neighbors=20):
-        
-        src_embed = self.tem_conv(cas_l, src_idx_l, cut_time_l, self.num_layers, num_neighbors)
-        target_embed = self.tem_conv(cas_l, target_idx_l, cut_time_l, self.num_layers, num_neighbors)
-        score = self.affinity_score(src_embed, target_embed) 
+        # 定义卷积层
+
+    def configure_optimizers(self, train_config):
+        """
+        This long function is unfortunately doing something very simple and is being very defensive:
+        We are separating out all parameters of the model into two buckets: those that will experience
+        weight decay for regularization and those that won't (biases, and layernorm/embedding weights).
+        We are then returning the PyTorch optimizer object.
+        """
+        # separate out all parameters to those that will and won't experience regularizing weight decay
+        decay = set()
+        no_decay = set()
+
+        for mn, m in self.named_modules():
+            for pn, p in m.named_parameters():
+                fpn = '%s.%s' % (mn, pn) if mn else pn # full param name
+                
+                if pn.endswith('bias'):
+                    # all biases will not be decayed
+                    no_decay.add(fpn)
+                elif pn.endswith('weight'):
+                    # weights of whitelist modules will be weight decayed
+                    decay.add(fpn)
+                elif "layer_norm" in pn or "embed" in pn:
+                    # weights of blacklist modules will NOT be weight decayed
+                    if fpn in decay:
+                        decay.remove(fpn)
+                    no_decay.add(fpn)
+                else:
+                    no_decay.add(fpn)
+
+        # validate that we considered every parameter
+        param_dict = {pn: p for pn, p in self.named_parameters()}
+        inter_params = decay & no_decay
+        union_params = decay | no_decay
+        assert len(inter_params) == 0, "parameters %s made it into both decay/no_decay sets!" % (str(inter_params), )
+        assert len(param_dict.keys() - union_params) == 0, "parameters %s were not separated into either decay/no_decay set!" \
+                                                    % (str(param_dict.keys() - union_params), )
+
+        # create the pytorch optimizer object
+        optim_groups = [
+            {"params": [param_dict[pn] for pn in sorted(list(decay))], "weight_decay": train_config.weight_decay},
+            {"params": [param_dict[pn] for pn in sorted(list(no_decay))], "weight_decay": 0.0},
+        ]
+        optimizer = torch.optim.AdamW(optim_groups, lr=train_config.lr)
+        return optimizer
+    
+
+    def forward(self, cas_l, src_idx_l, target_idx_l, cut_time_l, e_l, num_neighbors=20):
+                
+        src_embed = self.tem_conv(cas_l, src_idx_l, cut_time_l, e_l, self.num_layers, num_neighbors)
+        target_embed = self.tem_conv(cas_l, target_idx_l, cut_time_l, e_l, self.num_layers, num_neighbors)
         # TODO: 从node——>graph, graph pooling
-        g_score = score.mean(dim=0)
+        # cut_time_l_th = torch.from_numpy(cut_time_l).float().to(self.device)
+        # decay = torch.exp(self.decay_param * (3600 - cut_time_l_th) / 600).unsqueeze(-1)
+        embed = self.fuse(torch.cat((src_embed, target_embed), dim=-1))
+        # att pool
+        pooled_embed = self.conv_pool(embed)
+
+        g_score = self.output(pooled_embed).squeeze(0)
+
+        # mean pool
+        # pooled_embed = torch.mean(embed, dim=0, keepdim=True)
+        # g_score = self.output(pooled_embed).squeeze(1)
+
+        #score = self.affinity_score(src_embed, target_embed)
+        #g_score = score.mean(dim=0)
+        g_score = torch.clamp(g_score, min=0)
         return g_score
 
-    def tem_conv(self, cas_l, src_idx_l, cut_time_l, curr_layers, num_neighbors=20):
+    def tem_conv(self, cas_l, src_idx_l, cut_time_l, e_l, curr_layers, num_neighbors=20):
         assert(curr_layers >= 0)
-        
+    
         device = self.device
     
         batch_size = len(src_idx_l)
         
         src_node_batch_th = torch.from_numpy(src_idx_l).long().to(device)
         cut_time_l_th = torch.from_numpy(cut_time_l).float().to(device)
-        
         cut_time_l_th = torch.unsqueeze(cut_time_l_th, dim=1)
         # query node always has the start time -> time span == 0
-        src_node_t_embed = self.time_encoder(torch.zeros_like(cut_time_l_th))
+        src_node_t_embed = self.time_encoder(torch.zeros_like(cut_time_l_th), time_decay=True)
         src_node_feat = self.node_embed(src_node_batch_th)
-
+        #
+        src_e_batch = torch.from_numpy(e_l).long().to(device)
+        src_node_edge_feat = self.edge_embed(torch.zeros_like(src_e_batch))
         # 递归计算第k层tgat layer
         if curr_layers == 0:
             return src_node_feat
@@ -477,6 +658,7 @@ class TGAN(torch.nn.Module):
             src_node_conv_feat = self.tem_conv(cas_l,
                                            src_idx_l, 
                                            cut_time_l,
+                                           e_l,
                                            curr_layers=curr_layers - 1, 
                                            num_neighbors=num_neighbors)
             # 寻找src node的时序邻居
@@ -487,29 +669,37 @@ class TGAN(torch.nn.Module):
                                                                     num_neighbors=num_neighbors)
 
             src_ngh_node_batch_th = torch.from_numpy(src_ngh_node_batch).long().to(device)
-            src_ngh_eidx_batch = torch.from_numpy(src_ngh_eidx_batch).long().to(device)
+            
+
             
             src_ngh_t_batch_delta = cut_time_l[:, np.newaxis] - src_ngh_t_batch
-            src_ngh_t_batch_th = torch.from_numpy(src_ngh_t_batch_delta).float().to(device)
+            src_ngh_eidx_batch_delta = e_l[:, np.newaxis] - src_ngh_eidx_batch
+            src_ngh_eidx_batch_delta[src_ngh_eidx_batch_delta < 0] = 0
             
+            src_ngh_eidx_batch_th = torch.from_numpy(src_ngh_eidx_batch_delta).long().to(device)
+            src_ngh_t_batch_th = torch.from_numpy(src_ngh_t_batch_delta).float().to(device)
+            #src_ngh_t_batch_th = torch.as_tensor(src_ngh_t_batch_delta, dtype=torch.float32).to(device)
+
             # 得到k-1层src node neighbor的特征
             # get previous layer's node features
             src_ngh_node_batch_flat = src_ngh_node_batch.flatten() #reshape(batch_size, -1)
             src_ngh_t_batch_flat = src_ngh_t_batch.flatten() #reshape(batch_size, -1)  
+            src_ngh_e_batch_flat = src_ngh_eidx_batch.flatten()
             src_ngh_node_conv_feat = self.tem_conv(cas_l,
                                                    src_ngh_node_batch_flat, 
                                                    src_ngh_t_batch_flat,
+                                                   src_ngh_e_batch_flat,
                                                    curr_layers=curr_layers - 1, 
                                                    num_neighbors=num_neighbors)
             src_ngh_feat = src_ngh_node_conv_feat.view(batch_size, num_neighbors, -1)
             
             # get edge time features and node features
-            src_ngh_t_embed = self.time_encoder(src_ngh_t_batch_th)
-
+            #normed_src_ngh_t_batch_th = (src_ngh_t_batch_th - torch.mean(src_ngh_t_batch_th)) / torch.std(src_ngh_t_batch_th)
+            src_ngh_t_embed = self.time_encoder(src_ngh_t_batch_th, time_decay=True) # B, N, DIM
 # TODO: 加入边特征（节点数）
 
-            src_ngn_edge_feat = torch.zeros_like(src_ngh_feat)
-            # src_ngn_edge_feat = self.edge_embed(src_ngh_eidx_batch)
+            #src_ngn_edge_feat = torch.zeros_like(src_ngh_feat)    
+            src_ngn_edge_feat = self.edge_embed(src_ngh_eidx_batch_th)
             # 计算src node和neighbor的attention
             # attention aggregation
             mask = src_ngh_node_batch_th == 0
@@ -517,6 +707,7 @@ class TGAN(torch.nn.Module):
                         
             local, weight = attn_m(src_node_conv_feat, 
                                    src_node_t_embed,
+                                   src_node_edge_feat,
                                    src_ngh_feat,
                                    src_ngh_t_embed, 
                                    src_ngn_edge_feat, 
