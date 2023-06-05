@@ -1,18 +1,56 @@
 import pandas as pd
 import numpy as np
 import time
+import random
+import matplotlib. pyplot as plt
 # cascade 4: 128-146-128
 # cas15122: 1168952:0 1168952/1168953:10 1168952/1168953:12 1168952/1168953:6 1168952/1168953:19 1168952/1168953:24 1168952/1168953:28 1168952/1168953:26 1168952/1168953:21 1168952/1168953:17 1168952/1168953:3 1168952/1168953:14
 # '122605/122605/1152898:690' '122605/122605:58769' x
 # cas78491-num996-hub node
+def draw(pop):
+    ft=18
+    bwith=2
+    pop_counts = {}
+    for p in pop:
+        if p in pop_counts:
+            pop_counts[p] += 1
+        else:
+            pop_counts[p] = 1
+    plt.rcParams [ "font.weight"] = "bold" 
+    plt.rcParams [ "axes.labelweight"] = "bold"
+    # 提取横坐标和纵坐标数据
+    x = list(pop_counts.keys())
+    y = list(pop_counts.values())
+    ax = plt.gca()
+    ax.spines['bottom'].set_linewidth(bwith)
+    ax.spines['left'].set_linewidth(bwith)
+    ax.spines['top'].set_linewidth(bwith)
+    ax.spines['right'].set_linewidth(bwith)
+
+    # 绘制图形
+    plt.scatter(x, y, c="blue")
+
+    # 添加标签和标题
+    plt.xlabel('Popularity of cascades',fontsize=ft)
+    plt.ylabel('Number of cascades',fontsize=ft)
+    plt.yscale('symlog')
+    plt.xscale('symlog')
+    
+    plt.xticks(fontsize=ft)
+    plt.yticks(fontsize=ft)  
+    # 显示图形
+    plt.savefig('./figures/weibo_pop.pdf', bbox_inches='tight')
 
 def preprocess_weibo(data_name, cut_time):
     # cascadeID, user_id, publish_time, retweet_number, retweets
     cas_list, src_list, target_list, ts_list, label_list, size_list = [], [], [], [], [], []
     cas_num = 0
     f = open(data_name, 'r')
+    path_len = []
+    pop = []
     while True:
         cas_list_tmp, src_list_tmp, target_list_tmp, ts_list_tmp, label_list_tmp, size_list_tmp = [], [], [], [], [], []
+        
         line = f.readline()
         if not line:
             break
@@ -24,6 +62,7 @@ def preprocess_weibo(data_name, cut_time):
         pub_ts = int(entry[2])
         # 只选择8-18点之间发布的帖子
         hour = int(time.strftime("%H",time.localtime(pub_ts)))
+        pop.append(int(entry[3]))
         if hour < 8 or hour >= 18:
             continue
         label = int(entry[3])
@@ -35,8 +74,10 @@ def preprocess_weibo(data_name, cut_time):
         max_len = 0
         # if casid==78491:
         #     print(paths)
+        
         for p in paths:
             p_entry = p.split(':')
+            
             edge_ts = int(p_entry[1])
             # choose retweet before observation time 
             if edge_ts >= cut_time:
@@ -46,10 +87,12 @@ def preprocess_weibo(data_name, cut_time):
             if count_path > 100:
                 break
             unobserved_flag = False
+            
             if '/' not in p_entry[0]:
                 continue
             else:
                 node_arr = [int(n) for n in p_entry[0].split('/')]
+                path_len.append(len(node_arr))
                 for i in range(1, len(node_arr)):
                     if [node_arr[i - 1], node_arr[i]] not in observed_nodes:
                         # 128-146, 128-146-128
@@ -81,6 +124,15 @@ def preprocess_weibo(data_name, cut_time):
         cas_num += 1
     f.close()
     print('cas num: ', cas_num)
+    # val_cas_split = int(cas_num * 0.7)
+    # test_cas_split = int(cas_num * 0.85)
+    # random.seed(0)
+    # random.shuffle(path_len)
+    # train_pl = path_len[:val_cas_split]
+    # val_pl = path_len[val_cas_split: test_cas_split]
+    # test_pl = path_len[test_cas_split:]
+    # print(sum(train_pl) / len(train_pl), sum(val_pl) / len(val_pl), sum(test_pl) / len(test_pl))
+    draw(pop)
     return pd.DataFrame({'cas': cas_list,
                          'src': src_list, 
                          'target': target_list, 
@@ -92,8 +144,8 @@ def preprocess_weibo(data_name, cut_time):
 
 def run(data_name, cut_time):    
     PATH = '/root/shm/zzz_dataset/{}.txt'.format(data_name)
-    OUT_DF = './processed/ml_{}_{}_18.csv'.format(data_name, cut_time)
+    OUT_DF = './processed/ml_{}_{}.csv'.format(data_name, cut_time)
     df = preprocess_weibo(PATH, cut_time)
-    df.to_csv(OUT_DF)
+    # df.to_csv(OUT_DF)
 
-run('weibo', 3600)
+run('weibo', 1800)

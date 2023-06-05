@@ -13,14 +13,17 @@ class MergeLayer(torch.nn.Module):
         self.fc1 = torch.nn.Linear(dim1 + dim2, dim3)
         self.fc2 = torch.nn.Linear(dim3, dim4)
         self.act = torch.nn.ReLU()
-
+        self.dropout = torch.nn.Dropout(0.1)
         torch.nn.init.xavier_normal_(self.fc1.weight)
         torch.nn.init.xavier_normal_(self.fc2.weight)
         
     def forward(self, x1, x2):
-        x = torch.cat([x1, x2], dim=1)
+        if x2 == None:
+            x = x1
+        else:
+            x = torch.cat([x1, x2], dim=-1)
         #x = self.layer_norm(x)
-        h = self.act(self.fc1(x))
+        h = self.act(self.dropout(self.fc1(x)))
         return self.fc2(h)
 
 
@@ -241,7 +244,7 @@ class PosEncode(torch.nn.Module):
         
         self.pos_embeddings = nn.Embedding(num_embeddings=seq_len, embedding_dim=expand_dim)
         
-    def forward(self, ts):
+    def forward(self, ts, time_decay=False):
         # ts: [N, L]
         order = ts.argsort() # argsort(): 返回数组元素从小到大的索引值
         ts_emb = self.pos_embeddings(order)
@@ -253,7 +256,7 @@ class EmptyEncode(torch.nn.Module):
         super().__init__()
         self.expand_dim = expand_dim
         
-    def forward(self, ts):
+    def forward(self, ts, time_decay=False):
         out = torch.zeros_like(ts).float()
         out = torch.unsqueeze(out, dim=-1)
         out = out.expand(out.shape[0], out.shape[1], self.expand_dim)
@@ -298,7 +301,7 @@ class MeanPool(torch.nn.Module):
         self.act = torch.nn.ReLU()
         self.merger = MergeLayer(edge_dim + feat_dim, feat_dim, feat_dim, feat_dim)
         
-    def forward(self, src, src_t, seq, seq_t, seq_e, mask):
+    def forward(self, src, src_t, src_s, seq, seq_t, seq_e, mask):
         # seq [B, N, D]
         # mask [B, N]
         src_x = src
@@ -397,99 +400,46 @@ class AttnModel(torch.nn.Module):
 
 
 class ConvPool(nn.Module):
-    def __init__(self, in_channels, out_channels, feat_dim, n_head):
+    def __init__(self, in_channels, out_channels, feat_dim, n_head, device):
         super(ConvPool, self).__init__()
-        self.conv = nn.Conv1d(in_channels=in_channels, out_channels=out_channels, kernel_size=5, stride=1)
-        # self.attention = MultiHeadAttention(n_head, 
-        #                                      d_model=feat_dim, 
-        #                                      d_k=feat_dim // n_head, 
-        #                                      d_v=feat_dim // n_head, 
-        #                                      dropout=0.1)
-        self.attention = nn.MultiheadAttention(feat_dim, n_head, dropout=0.1)
-
-    def forward(self, x):
-        # x shape: [num_nodes, dim]
-        x = x.unsqueeze(0).transpose(1, 2) # [1, dim, num_nodes]
-        x = self.conv(x).transpose(1, 2) # [1, num_nodes, out_channels]
-        x = F.relu(x)
-        attn_output, attn_output_weights = self.attention(x, x, x)
-        attn_output = attn_output + x
-        attn_output = torch.mean(attn_output, dim=1)
-        return attn_output
-    
-class ConvLSTMPool(nn.Module):
-    def __init__(self, feat_dim, device, n_head):
-        super(ConvLSTMPool, self).__init__()
-        self.conv = nn.Conv1d(in_channels=feat_dim, out_channels=feat_dim, kernel_size=5, stride=1)
-        self.attention = nn.MultiheadAttention(feat_dim, n_head, dropout=0.1)
-        self.lstm = torch.nn.LSTM(input_size=feat_dim, 
-                                  hidden_size=feat_dim, 
-                                  num_layers=1, 
-                                  batch_first=True)
+        self.conv_1 = nn.Conv1d(in_channels=in_channels, out_channels=out_channels, kernel_size=5, stride=1, padding=2)
+        self.dim = feat_dim
         self.device = device
-    
+        self.layernorm = nn.LayerNorm(feat_dim)
+
     def forward(self, x):
         # x shape: [num_nodes, dim]
-        x = x.unsqueeze(0).transpose(1, 2) # [1, dim, num_nodes]
-        x = self.conv(x)  # [1, out_channels, num_nodes]
-        x = x.transpose(1, 2) # [1, num_nodes, out_channels]
+        residual = x
+        x = x.unsqueeze(0) 
+        x = x.transpose(1, 2)
+        x = self.conv_1(x)
+        x = x.transpose(1, 2)
         x = F.relu(x)
-        attn_output, attn_output_weights = self.attention(x, x, x)
-        attn_output = attn_output + x
-        #pad_x = nn.utils.rnn.pack_padded_sequence(x, 100, batch_first=True, enforce_sorted=False).to(self.device)
-        _, (hn, _) = self.lstm(attn_output)
-        hn = hn.squeeze(0)
-        # unpad_h = nn.utils.rnn.pad_packed_sequence(hn, batch_first=True)
-        return hn
-    
-# class global_attention(nn.Module):
-#     def __init__(self, in_features, hidden_dim):
-#         super(global_attention, self).__init__()
-#         self.linear1 = nn.Linear(in_features, hidden_dim)
-#         self.linear2 = nn.Linear(hidden_dim, 1)
+        output = self.layernorm(x + residual)
 
-#     def forward(self, x):
-#         # x shape: [batch_size, num_nodes, in_features]
-#         #energy = self.linear2(F.relu(self.linear1(x))) # [batch_size, num_nodes, 1]
-#         energy = self.linear2(x)
-#         alpha = F.softmax(energy, dim=1) # [batch_size, num_nodes, 1]
-#         attended_x = torch.sum(alpha * x, dim=1) # [batch_size, in_features]
-#         return attended_x
-
-# class ConvPool(nn.Module):
-#     def __init__(self, in_channels, out_channels, feat_dim, num_heads):
-#         super(ConvPool, self).__init__()
-#         self.conv = nn.Conv1d(in_channels=in_channels, out_channels=out_channels, kernel_size=5, stride=1)
-#         # self.conv_attention = global_attention(feat_dim, feat_dim)
-#         #self.out_attention = global_attention(feat_dim, feat_dim)
-#         self.multihead_attention = nn.MultiheadAttention(feat_dim, num_heads, batch_first=True)
-        
-#     def forward(self, x):
-#         # x shape: [num_nodes, dim]
-#         x = x.unsqueeze(0).transpose(1, 2) # [1, dim, num_nodes]
-#         x = self.conv(x)  # [1, out_channels, num_nodes]
-#         x = x.transpose(1, 2) # [1, num_nodes, out_channels]
-#         x = F.relu(x)
-#         #x = x.unsqueeze(0)
-        
-#         #x, _ = self.multihead_attention(x, x, x)
-#         #x = x.mean(dim=1)
-#         x = self.out_attention(x)
-#         # Apply attention over the kernel-level windows
-#         # x = x.unfold(1, self.conv.kernel_size[0], 1).squeeze(0)  # [num_nodes, out_channels, kernel_size]
-#         # x = x.transpose(1, 2) # [num_nodes, kernel_size, out_channels]
-#         # x = self.conv_attention(x).unsqueeze(0)  # [1, num_nodes, out_channels]
-#         # x = self.out_attention(x) # [1, out_channels]
-#         return x
+        return output.squeeze(0)
 
     
+class global_attention(nn.Module):
+    def __init__(self, in_features, hidden_dim):
+        super(global_attention, self).__init__()
+        self.linear1 = nn.Linear(in_features, hidden_dim)
+        self.linear2 = nn.Linear(hidden_dim, 1)
+        nn.init.xavier_normal_(self.linear1.weight)
+        nn.init.xavier_normal_(self.linear2.weight)
+    def forward(self, x):
+        energy = self.linear2(x)
+        alpha = F.softmax(energy, dim=1)
+        attended_x = torch.sum(alpha * x, dim=1) 
+        return attended_x
+
+        
 class TGAN(torch.nn.Module):
     def __init__(self, ngh_finder, node_num, edge_num, feat_dim, device,
                  attn_mode='prod', use_time='time', agg_method='attn',
                  num_layers=3, n_head=4, null_idx=0, num_heads=1, drop_out=0.1, decay=-1, seq_len=None):
         super(TGAN, self).__init__()
-        #self.conv_pool = ConvPool(feat_dim, feat_dim, feat_dim, num_heads)
-        self.conv_pool = ConvLSTMPool(feat_dim, device, num_heads)
+        #self.conv_pool = torch.nn.ModuleList([ConvPool(feat_dim, feat_dim, feat_dim, num_heads, device) for _ in range(num_layers)])
         self.node_num = node_num
         self.edge_num = edge_num
         self.feat_dim = feat_dim
@@ -514,19 +464,15 @@ class TGAN(torch.nn.Module):
         )
 
         self.use_time = use_time
-        self.merge_layer = MergeLayer(self.feat_dim, self.feat_dim, self.feat_dim, self.feat_dim)
-        self.decay_param = torch.nn.Parameter(torch.tensor(decay).float())
-        self.output = nn.Linear(self.feat_dim, 1)
-        self.attlinear = nn.Linear(self.feat_dim, 1)
-        self.fuse = nn.Sequential(
-            nn.Linear(self.feat_dim * 2, self.feat_dim),
-            nn.ReLU()
-        )
-        nn.init.xavier_normal_(self.attlinear.weight)
-        nn.init.xavier_normal_(self.fuse[0].weight)
+        self.merge_layer_list = torch.nn.ModuleList([MergeLayer(self.feat_dim, self.feat_dim, self.feat_dim, self.feat_dim) for _ in range(num_layers)])
+        self.att_affine_list = torch.nn.ModuleList([MergeLayer(self.feat_dim, 0, self.feat_dim // 2, 1) for _ in range(num_layers)])
+
+        self.output = MergeLayer(self.feat_dim, 0, self.feat_dim // 2, 1)
+        self.layer_weight = nn.Parameter(torch.ones(num_layers).float())
+        
+
         nn.init.xavier_normal_(self.node_embed[0].weight)
         nn.init.xavier_normal_(self.edge_embed[0].weight)
-        nn.init.xavier_normal_(self.output.weight)
 
         if agg_method == 'attn':
             self.logger.info('Aggregation uses attention model')
@@ -613,28 +559,34 @@ class TGAN(torch.nn.Module):
     
 
     def forward(self, cas_l, src_idx_l, target_idx_l, cut_time_l, e_l, num_neighbors=20):
-                
-        src_embed = self.tem_conv(cas_l, src_idx_l, cut_time_l, e_l, self.num_layers, num_neighbors)
-        target_embed = self.tem_conv(cas_l, target_idx_l, cut_time_l, e_l, self.num_layers, num_neighbors)
-        # TODO: 从node——>graph, graph pooling
-        # cut_time_l_th = torch.from_numpy(cut_time_l).float().to(self.device)
-        # decay = torch.exp(self.decay_param * (3600 - cut_time_l_th) / 600).unsqueeze(-1)
-        embed = self.fuse(torch.cat((src_embed, target_embed), dim=-1))
-        # att pool
-        pooled_embed = self.conv_pool(embed)
+        src_list, target_list = [], []
+        src_embed = self.tem_conv(src_list, cas_l, src_idx_l, cut_time_l, e_l, self.num_layers, num_neighbors)
+        target_embed = self.tem_conv(target_list, cas_l, target_idx_l, cut_time_l, e_l, self.num_layers, num_neighbors)
+        # 从node——>graph, graph pooling
 
-        g_score = self.output(pooled_embed).squeeze(0)
+        src_list = [src_list[0], src_list[2]]
+        target_list = [target_list[0], target_list[2]]
+        embed_list = []
+        for i in range(len(src_list)):
+            embed = self.merge_layer_list[i](src_list[i], target_list[i])
+            #embed = self.conv_pool[i](embed)
+            att_score = F.softmax(self.att_affine_list[i](embed, None), dim=0)
+            att_embed = torch.sum(embed * att_score, dim=0)
+            embed_list.append(att_embed)
+        embed = torch.stack(embed_list, dim=0)
+        weighted_embed = torch.sum(embed * self.layer_weight.view(-1, 1), dim=0, keepdim=True)
+        
+        # embed = self.merge_layer_list[0](src_embed, target_embed)
+        # att_score = F.softmax(self.att_affine_list[0](embed, None), dim=0)
+        # weighted_embed = torch.sum(embed * att_score, dim=0)
 
-        # mean pool
-        # pooled_embed = torch.mean(embed, dim=0, keepdim=True)
-        # g_score = self.output(pooled_embed).squeeze(1)
+        
+        g_score = self.output(weighted_embed, None)
 
-        #score = self.affinity_score(src_embed, target_embed)
-        #g_score = score.mean(dim=0)
         g_score = torch.clamp(g_score, min=0)
         return g_score
 
-    def tem_conv(self, cas_l, src_idx_l, cut_time_l, e_l, curr_layers, num_neighbors=20):
+    def tem_conv(self, feat_l, cas_l, src_idx_l, cut_time_l, e_l, curr_layers, num_neighbors=20):
         assert(curr_layers >= 0)
     
         device = self.device
@@ -655,7 +607,8 @@ class TGAN(torch.nn.Module):
             return src_node_feat
         else:
             # 得到k-1层src node特征
-            src_node_conv_feat = self.tem_conv(cas_l,
+            src_node_conv_feat = self.tem_conv(feat_l,
+                                               cas_l,
                                            src_idx_l, 
                                            cut_time_l,
                                            e_l,
@@ -685,7 +638,8 @@ class TGAN(torch.nn.Module):
             src_ngh_node_batch_flat = src_ngh_node_batch.flatten() #reshape(batch_size, -1)
             src_ngh_t_batch_flat = src_ngh_t_batch.flatten() #reshape(batch_size, -1)  
             src_ngh_e_batch_flat = src_ngh_eidx_batch.flatten()
-            src_ngh_node_conv_feat = self.tem_conv(cas_l,
+            src_ngh_node_conv_feat = self.tem_conv(feat_l,
+                                                   cas_l,
                                                    src_ngh_node_batch_flat, 
                                                    src_ngh_t_batch_flat,
                                                    src_ngh_e_batch_flat,
@@ -696,9 +650,10 @@ class TGAN(torch.nn.Module):
             # get edge time features and node features
             #normed_src_ngh_t_batch_th = (src_ngh_t_batch_th - torch.mean(src_ngh_t_batch_th)) / torch.std(src_ngh_t_batch_th)
             src_ngh_t_embed = self.time_encoder(src_ngh_t_batch_th, time_decay=True) # B, N, DIM
-# TODO: 加入边特征（节点数）
 
-            #src_ngn_edge_feat = torch.zeros_like(src_ngh_feat)    
+
+            #src_ngn_edge_feat = torch.zeros_like(src_ngh_feat)   
+            # 加入scale特征 
             src_ngn_edge_feat = self.edge_embed(src_ngh_eidx_batch_th)
             # 计算src node和neighbor的attention
             # attention aggregation
@@ -712,4 +667,5 @@ class TGAN(torch.nn.Module):
                                    src_ngh_t_embed, 
                                    src_ngn_edge_feat, 
                                    mask)
+            feat_l.append(local)
             return local

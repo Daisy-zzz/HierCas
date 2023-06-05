@@ -14,13 +14,11 @@ from tqdm import tqdm
 from utils import EarlyStopMonitor
 import utils
 import os
-from torch.utils.data import DataLoader, Dataset
-from torchmetrics import MeanSquaredLogError
 import torch.nn as nn
 import wandb
 import torch.optim.lr_scheduler as lr_scheduler
 
-exp_seed = 5576
+exp_seed = 0
 random.seed(exp_seed)
 np.random.seed(exp_seed)
 torch.manual_seed(exp_seed)
@@ -28,15 +26,14 @@ os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
 
 ### Argument and global variables
 parser = argparse.ArgumentParser('Interface for experiments')
-parser.add_argument('-d', '--data', type=str, help='data sources to use, try weibo', default='weibo_3600_18')
+parser.add_argument('-d', '--data', type=str, help='data sources to use, try weibo or aps', default='aps_3')
 parser.add_argument('--prefix', type=str, default='')
 parser.add_argument('--n_degree', type=int, default=20, help='number of neighbors to sample')
 parser.add_argument('--n_head', type=int, default=4)
 parser.add_argument('--n_epoch', type=int, default=20, help='number of epochs')
 parser.add_argument('--n_layer', type=int, default=2)
-parser.add_argument('--lr', type=float, default=5e-5)
+parser.add_argument('--lr', type=float, default=3e-5)
 parser.add_argument('--bs', type=int, default=64)
-parser.add_argument('--time_decay', type=float, default=-1)
 parser.add_argument('--weight_decay', type=float, default=1e-2)
 parser.add_argument('--drop_out', type=float, default=0.1, help='dropout probability')
 parser.add_argument('--gpu', type=int, default=1, help='idx for the gpu to use')
@@ -65,7 +62,6 @@ SEQ_LEN = NUM_NEIGHBORS
 DATA = args.data
 NUM_LAYER = args.n_layer
 LEARNING_RATE = args.lr
-TDECAY = args.time_decay
 FEAT_DIM = args.feat_dim
 BSIZE = args.bs
 ### set up logger
@@ -106,7 +102,7 @@ def eval_one_epoch(num_batch, cas_dict, s_idx, e_idx, tgan, cas, src, dst, ts, t
 
             score = tgan.forward(cas_l_cut, src_l_cut, dst_l_cut, ts_l_cut, e_l_cut, NUM_NEIGHBORS)
             label = label_l_cut[0] - max(e_l_cut)
-            
+            label = np.log2(label + 1)
             batch_score.append(score)  
             batch_label.append(label)
 
@@ -125,13 +121,16 @@ def eval_one_epoch(num_batch, cas_dict, s_idx, e_idx, tgan, cas, src, dst, ts, t
 
         test_loss = tr_loss / nb_tr_steps
 
-        predictions = np.array([1.0 if pred < 1.0 else pred for pred in scores]).reshape(-1, )
-        test_labels = np.array([1.0 if label < 1.0 else label for label in labels]).reshape(-1, )
-        MSLE = np.mean(np.square(np.log2(predictions) - np.log2(test_labels)))
-        mSLE = np.median(np.square(np.log2(predictions) - np.log2(test_labels)))
-        MAPE = np.mean(np.abs(np.log2(predictions + 1) - np.log2(test_labels + 1)) / np.log2(test_labels + 2))
+        predictions = np.array(scores).reshape(-1, )
+        test_labels = np.array(labels).reshape(-1, )
+        MSLE = np.mean(np.square(predictions - test_labels))
+    
+        SMAPE = np.mean(np.abs(np.subtract(predictions, test_labels)) / ((np.abs(predictions) + np.abs(test_labels)) / 2))
+        rss = np.mean(np.square(np.subtract(predictions, test_labels)))
+        tss = np.mean(np.square(test_labels - np.mean(test_labels)))
+        r2_score = 1 - rss / tss
         
-    return test_loss, MSLE, mSLE, MAPE
+    return test_loss, MSLE, SMAPE, r2_score
 
 ### Load data and train val test split
 g_df = pd.read_csv('./processed/ml_{}.csv'.format(DATA))
@@ -154,7 +153,6 @@ cas_num = len(cas_list)
 # spilt train, val, test by cas_id to 7:1.5:1.5
 val_cas_split = int(cas_num * 0.7)
 test_cas_split = int(cas_num * 0.85)
-print(val_cas_split, test_cas_split)
 
 
 # 以cas_l进行分组
@@ -209,7 +207,8 @@ test_label_l = test_df.label
 
 train_cas_num = len(train_cas)
 test_cas_num = len(test_cas)
-print("train_cas_num: {}, test_cas_num: {}".format(train_cas_num, test_cas_num))
+val_cas_num = cas_num - train_cas_num - test_cas_num
+print("total_cas_num: {}, train_cas_num: {}, val_cas_num: {}, test_cas_num: {}".format(cas_num, train_cas_num, val_cas_num, test_cas_num))
 
 ### Initialize the data structure for graph and edge sampling
 
@@ -233,13 +232,13 @@ device = torch.device('cuda:{}'.format(GPU))
 #device = torch.device('cpu')
 tgan = TGAN(train_ngh_finder, node_num=NODE_NUM, edge_num=EDGE_NUM, feat_dim=FEAT_DIM, device=device,
             num_layers=NUM_LAYER, use_time=USE_TIME, agg_method=AGG_METHOD, attn_mode=ATTN_MODE,
-            seq_len=SEQ_LEN, n_head=NUM_HEADS, drop_out=DROP_OUT, decay=TDECAY)
+            seq_len=SEQ_LEN, n_head=NUM_HEADS, drop_out=DROP_OUT)
 tgan = tgan.to(device)
 
 optimizer = tgan.configure_optimizers(args)
-criterion = MeanSquaredLogError().to(device)
+#criterion = MeanSquaredLogError().to(device)
 #criterion = nn.HuberLoss().to(device)
-
+criterion = nn.MSELoss().to(device)
 num_instance = len(train_src_l)
 num_batch = train_cas_num
 logger.info('num of training instances: {}'.format(num_instance))
@@ -250,6 +249,7 @@ early_stopper = EarlyStopMonitor()
 wandb.init(project="GRLPP")
 wandb.config.update(args)
 
+scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=5, gamma=0.5)
 
 #scheduler = lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=NUM_EPOCH // 2, T_mult=2)
 for epoch in range(NUM_EPOCH):
@@ -276,15 +276,17 @@ for epoch in range(NUM_EPOCH):
         tgan = tgan.train()
         score = tgan.forward(cas_l_cut, src_l_cut, dst_l_cut, ts_l_cut, e_l_cut, NUM_NEIGHBORS)
         label = label_l_cut[0] - max(e_l_cut)
+        label = np.log2(label + 1)
         batch_score.append(score)
         batch_label.append(label)
         if (k + 1) % BSIZE == 0 or k == num_batch - 1: 
             batch_score = torch.stack(batch_score).view(-1).to(device)
             batch_label = torch.as_tensor(batch_label, dtype=torch.float32).to(device)
             loss = criterion(batch_score, batch_label)
-            print(loss)
+            #print(loss)
             optimizer.zero_grad()
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(parameters=tgan.parameters(), max_norm=5, norm_type=2)
             optimizer.step()
             tr_loss += loss.item()
             nb_tr_steps += 1
@@ -295,16 +297,18 @@ for epoch in range(NUM_EPOCH):
     # validation phase
     tgan.ngh_finder = test_ngh_finder
     test_s_idx, test_e_idx = 0, cas_dict[test_cas_l[0]]
-    test_loss, MSLE, mSLE, MAPE = eval_one_epoch(test_cas_num, cas_dict, test_s_idx, test_e_idx, tgan, test_cas_l, test_src_l, test_dst_l, test_ts_l, test_e_l, test_label_l)
-    logger.info('end {} epoch, train loss is {}, test loss is {}, MSLE is {}, mSLE is {}, MAPE is {}'.format(epoch, train_loss, test_loss, MSLE, mSLE, MAPE))
+    test_loss, MSLE, SMAPE, R2 = eval_one_epoch(test_cas_num, cas_dict, test_s_idx, test_e_idx, tgan, test_cas_l, test_src_l, test_dst_l, test_ts_l, test_e_l, test_label_l)
+    scheduler.step()
+    logger.info('end {} epoch, train loss is {}, test loss is {}, MSLE is {}, SMAPE is {}, R2 is {}'.format(epoch, train_loss, test_loss, MSLE, SMAPE, R2))
     wandb.log(
             (
                 {
                     "train_loss": train_loss,
                     "test_loss": test_loss,
                     "MSLE": MSLE,
-                    "mSLE": mSLE,
-                    "MAPE": MAPE,
+                    "SMAPE": SMAPE,
+                    "r2": R2
                 }
             )
-        )
+       )
+    
