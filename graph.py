@@ -107,6 +107,7 @@ class NeighborFinder:
         out_ngh_eidx_batch = np.zeros((len(src_idx_l), num_neighbors)).astype(np.int32)
         for i, (cas_id, src_idx, cut_time) in enumerate(zip(cas_l, src_idx_l, cut_time_l)):
             ngh_idx, ngh_eidx, ngh_ts = self.find_before(cas_id, src_idx, cut_time)
+            print(len(ngh_idx))
             if len(ngh_idx) > 0:
                 if self.uniform:
                     sampled_idx = np.random.randint(0, len(ngh_idx), num_neighbors)

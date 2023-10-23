@@ -112,87 +112,6 @@ class MultiHeadAttention(nn.Module):
         return output, attn
     
 
-class MapBasedMultiHeadAttention(nn.Module):
-    ''' Multi-Head Attention module '''
-
-    def __init__(self, n_head, d_model, d_k, d_v, dropout=0.1):
-        super().__init__()
-
-        self.n_head = n_head
-        self.d_k = d_k
-        self.d_v = d_v
-
-        self.wq_node_transform = nn.Linear(d_model, n_head * d_k, bias=False)
-        self.wk_node_transform = nn.Linear(d_model, n_head * d_k, bias=False)
-        self.wv_node_transform = nn.Linear(d_model, n_head * d_k, bias=False)
-        
-        self.layer_norm = nn.LayerNorm(d_model)
-
-        self.fc = nn.Linear(n_head * d_v, d_model)
-        
-        self.act = nn.LeakyReLU(negative_slope=0.2)
-        self.weight_map = nn.Linear(2 * d_k, 1, bias=False)
-        
-        nn.init.xavier_normal_(self.fc.weight)
-        
-        self.dropout = torch.nn.Dropout(dropout)
-        self.softmax = torch.nn.Softmax(dim=2)
-
-        self.dropout = nn.Dropout(dropout)
-
-
-    def forward(self, q, k, v, mask=None):
-
-        d_k, d_v, n_head = self.d_k, self.d_v, self.n_head
-
-        sz_b, len_q, _ = q.size()
-        
-        sz_b, len_k, _ = k.size()
-        sz_b, len_v, _ = v.size()
-
-        residual = q
-
-        q = self.wq_node_transform(q).view(sz_b, len_q, n_head, d_k)
-        
-        k = self.wk_node_transform(k).view(sz_b, len_k, n_head, d_k)
-        
-        v = self.wv_node_transform(v).view(sz_b, len_v, n_head, d_v)
-
-        q = q.permute(2, 0, 1, 3).contiguous().view(-1, len_q, d_k) # (n*b) x lq x dk
-        q = torch.unsqueeze(q, dim=2) # [(n*b), lq, 1, dk]
-        q = q.expand(q.shape[0], q.shape[1], len_k, q.shape[3]) # [(n*b), lq, lk, dk]
-        
-        k = k.permute(2, 0, 1, 3).contiguous().view(-1, len_k, d_k) # (n*b) x lk x dk
-        k = torch.unsqueeze(k, dim=1) # [(n*b), 1, lk, dk]
-        k = k.expand(k.shape[0], len_q, k.shape[2], k.shape[3]) # [(n*b), lq, lk, dk]
-        
-        v = v.permute(2, 0, 1, 3).contiguous().view(-1, len_v, d_v) # (n*b) x lv x dv
-        
-        mask = mask.repeat(n_head, 1, 1) # (n*b) x lq x lk
-        
-        ## Map based Attention
-        #output, attn = self.attention(q, k, v, mask=mask)
-        q_k = torch.cat([q, k], dim=3) # [(n*b), lq, lk, dk * 2]
-        attn = self.weight_map(q_k).squeeze(dim=3) # [(n*b), lq, lk]
-        
-        if mask is not None:
-            attn = attn.masked_fill(mask, -1e10)
-
-        attn = self.softmax(attn) # [n * b, l_q, l_k]
-        attn = self.dropout(attn) # [n * b, l_q, l_k]
-        
-        # [n * b, l_q, l_k] * [n * b, l_v, d_v] >> [n * b, l_q, d_v]
-        output = torch.bmm(attn, v)
-        
-        output = output.view(n_head, sz_b, len_q, d_v)
-        
-        output = output.permute(1, 2, 0, 3).contiguous().view(sz_b, len_q, -1) # b x lq x (n*dv)
-
-        output = self.dropout(self.act(self.fc(output)))
-        output = self.layer_norm(output + residual)
-
-        return output, attn
-    
 def expand_last_dim(x, num):
     view_size = list(x.size()) + [1]
     expand_size = list(x.size()) + [num]
@@ -206,7 +125,6 @@ class TimeEncode(torch.nn.Module):
         
         time_dim = expand_dim
         self.factor = factor
-        # 生成初始的维度为timedim的频率系数w，以及偏差，转为nn.Parameter在后续可被优化
         
         self.basis_freq = torch.nn.Parameter((torch.from_numpy(1 / 10 ** np.linspace(0, 9, time_dim))).float())
         self.phase = torch.nn.Parameter(torch.zeros(time_dim).float())
@@ -509,8 +427,7 @@ class TGAN(torch.nn.Module):
         else:
             raise ValueError('invalid time option!')
         
-        self.affinity_score = MergeLayer(self.feat_dim, self.feat_dim, self.feat_dim, 1) # torch.nn.Bilinear(self.feat_dim, self.feat_dim, 1, bias=True)
-        # 定义卷积层
+        self.affinity_score = MergeLayer(self.feat_dim, self.feat_dim, self.feat_dim, 1) 
 
     def configure_optimizers(self, train_config):
         """
@@ -562,15 +479,18 @@ class TGAN(torch.nn.Module):
         src_list, target_list = [], []
         src_embed = self.tem_conv(src_list, cas_l, src_idx_l, cut_time_l, e_l, self.num_layers, num_neighbors)
         target_embed = self.tem_conv(target_list, cas_l, target_idx_l, cut_time_l, e_l, self.num_layers, num_neighbors)
-        # 从node——>graph, graph pooling
+        # graph pooling
 
         src_list = [src_list[0], src_list[2]]
         target_list = [target_list[0], target_list[2]]
         embed_list = []
+        att = 0
         for i in range(len(src_list)):
             embed = self.merge_layer_list[i](src_list[i], target_list[i])
             #embed = self.conv_pool[i](embed)
             att_score = F.softmax(self.att_affine_list[i](embed, None), dim=0)
+            if i == 1:
+                att = att_score
             att_embed = torch.sum(embed * att_score, dim=0)
             embed_list.append(att_embed)
         embed = torch.stack(embed_list, dim=0)
@@ -584,7 +504,7 @@ class TGAN(torch.nn.Module):
         g_score = self.output(weighted_embed, None)
 
         g_score = torch.clamp(g_score, min=0)
-        return g_score
+        return g_score, att
 
     def tem_conv(self, feat_l, cas_l, src_idx_l, cut_time_l, e_l, curr_layers, num_neighbors=20):
         assert(curr_layers >= 0)
@@ -602,11 +522,9 @@ class TGAN(torch.nn.Module):
         #
         src_e_batch = torch.from_numpy(e_l).long().to(device)
         src_node_edge_feat = self.edge_embed(torch.zeros_like(src_e_batch))
-        # 递归计算第k层tgat layer
         if curr_layers == 0:
             return src_node_feat
         else:
-            # 得到k-1层src node特征
             src_node_conv_feat = self.tem_conv(feat_l,
                                                cas_l,
                                            src_idx_l, 
@@ -614,7 +532,6 @@ class TGAN(torch.nn.Module):
                                            e_l,
                                            curr_layers=curr_layers - 1, 
                                            num_neighbors=num_neighbors)
-            # 寻找src node的时序邻居
             src_ngh_node_batch, src_ngh_eidx_batch, src_ngh_t_batch = self.ngh_finder.get_temporal_neighbor(
                                                                     cas_l,
                                                                     src_idx_l, 
@@ -633,7 +550,6 @@ class TGAN(torch.nn.Module):
             src_ngh_t_batch_th = torch.from_numpy(src_ngh_t_batch_delta).float().to(device)
             #src_ngh_t_batch_th = torch.as_tensor(src_ngh_t_batch_delta, dtype=torch.float32).to(device)
 
-            # 得到k-1层src node neighbor的特征
             # get previous layer's node features
             src_ngh_node_batch_flat = src_ngh_node_batch.flatten() #reshape(batch_size, -1)
             src_ngh_t_batch_flat = src_ngh_t_batch.flatten() #reshape(batch_size, -1)  
@@ -653,9 +569,8 @@ class TGAN(torch.nn.Module):
 
 
             #src_ngn_edge_feat = torch.zeros_like(src_ngh_feat)   
-            # 加入scale特征 
+            # add scale features 
             src_ngn_edge_feat = self.edge_embed(src_ngh_eidx_batch_th)
-            # 计算src node和neighbor的attention
             # attention aggregation
             mask = src_ngh_node_batch_th == 0
             attn_m = self.attn_model_list[curr_layers - 1]

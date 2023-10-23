@@ -11,12 +11,11 @@ import math
 from graph import NeighborFinder
 from module import TGAN
 from tqdm import tqdm
-from utils import EarlyStopMonitor
-import utils
 import os
 import torch.nn as nn
 import wandb
 import torch.optim.lr_scheduler as lr_scheduler
+import utils
 
 exp_seed = 0
 random.seed(exp_seed)
@@ -26,11 +25,11 @@ os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
 
 ### Argument and global variables
 parser = argparse.ArgumentParser('Interface for experiments')
-parser.add_argument('-d', '--data', type=str, help='data sources to use, try weibo or aps', default='aps_3')
+parser.add_argument('-d', '--data', type=str, help='data sources to use, try weibo or aps', default='weibo_1800')
 parser.add_argument('--prefix', type=str, default='')
 parser.add_argument('--n_degree', type=int, default=20, help='number of neighbors to sample')
 parser.add_argument('--n_head', type=int, default=4)
-parser.add_argument('--n_epoch', type=int, default=20, help='number of epochs')
+parser.add_argument('--n_epoch', type=int, default=5, help='number of epochs')
 parser.add_argument('--n_layer', type=int, default=2)
 parser.add_argument('--lr', type=float, default=3e-5)
 parser.add_argument('--bs', type=int, default=64)
@@ -100,7 +99,7 @@ def eval_one_epoch(num_batch, cas_dict, s_idx, e_idx, tgan, cas, src, dst, ts, t
                 s_idx = e_idx
                 e_idx = s_idx + cas_dict[test_cas_l[s_idx]]
 
-            score = tgan.forward(cas_l_cut, src_l_cut, dst_l_cut, ts_l_cut, e_l_cut, NUM_NEIGHBORS)
+            score, att_score = tgan.forward(cas_l_cut, src_l_cut, dst_l_cut, ts_l_cut, e_l_cut, NUM_NEIGHBORS)
             label = label_l_cut[0] - max(e_l_cut)
             label = np.log2(label + 1)
             batch_score.append(score)  
@@ -139,12 +138,11 @@ cas_list = g_df['cas'].unique().tolist()
 num_graphs = len(cas_list)
 node_list = pd.concat([g_df['src'], g_df['target']]).unique().tolist()
 edge_list = g_df['e_idx'].unique().tolist()
-# 将cas编号进行映射
+# map id
 casid_dict = {old_cas: new_cas for new_cas, old_cas in enumerate(cas_list)}
 node_dict = {old_node: new_node for new_node, old_node in enumerate(node_list)}
 print("different node num: ", len(node_list))
 edge_dict = {old_edge: new_edge for new_edge, old_edge in enumerate(edge_list)}
-# 根据映射字典，将原始数据中的cas编号替换为新的编号
 g_df['cas'] = g_df['cas'].apply(lambda x: casid_dict[x])
 g_df['src'] = g_df['src'].apply(lambda x: node_dict[x])
 g_df['target'] = g_df['target'].apply(lambda x: node_dict[x])
@@ -154,16 +152,12 @@ cas_num = len(cas_list)
 val_cas_split = int(cas_num * 0.7)
 test_cas_split = int(cas_num * 0.85)
 
-
-# 以cas_l进行分组
 grouped = g_df.groupby('cas')
 
-# 打乱各组的顺序
 np.random.seed(exp_seed)
 group_order = np.random.permutation(list(grouped.groups.keys()))
 shuffled_groups = [grouped.get_group(key) for key in group_order]
 
-# 合并结果
 shuffled_g_df = pd.concat(shuffled_groups, ignore_index=True)
 
 cas_l = shuffled_g_df.cas
@@ -183,11 +177,9 @@ for idx, cas in enumerate(cas_l):
         cas_dict[cas] += 1
 print(len(cas_dict.keys()), min(cas_dict.values()), np.mean(list(cas_dict.values())), max(cas_dict.values()))
 
-# 获取划分点前的cas和划分点后的cas
 train_cas = group_order[:val_cas_split]
 test_cas = group_order[test_cas_split:]
 
-# 将DataFrame分成训练集和测试集
 train_df = pd.concat([grouped.get_group(cas) for cas in train_cas]).reset_index(drop=True)
 test_df = pd.concat([grouped.get_group(cas) for cas in test_cas]).reset_index(drop=True)
 
@@ -243,15 +235,14 @@ num_instance = len(train_src_l)
 num_batch = train_cas_num
 logger.info('num of training instances: {}'.format(num_instance))
 logger.info('num of batches per epoch: {}'.format(num_batch))
-early_stopper = EarlyStopMonitor()
+#early_stopper = EarlyStopMonitor()
 
 
-wandb.init(project="GRLPP")
-wandb.config.update(args)
+# wandb.init(project="GRLPP")
+# wandb.config.update(args)
 
 scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=5, gamma=0.5)
 
-#scheduler = lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=NUM_EPOCH // 2, T_mult=2)
 for epoch in range(NUM_EPOCH):
     # use a cas graph as a batch
     tgan.ngh_finder = train_ngh_finder
@@ -262,7 +253,6 @@ for epoch in range(NUM_EPOCH):
     batch_score = []
     batch_label = []
     for k in tqdm(range(num_batch), desc='Train'):
-        # TODO: 目前选择一个cas的所有参与节点建图，可以修改为只采样重要节点
         cas_l_cut = train_cas_l[s_idx:e_idx].to_numpy()
         src_l_cut = train_src_l[s_idx:e_idx].to_numpy()
         dst_l_cut = train_dst_l[s_idx:e_idx].to_numpy()
@@ -274,7 +264,9 @@ for epoch in range(NUM_EPOCH):
             s_idx = e_idx
             e_idx = s_idx + cas_dict[train_cas_l[s_idx]]
         tgan = tgan.train()
-        score = tgan.forward(cas_l_cut, src_l_cut, dst_l_cut, ts_l_cut, e_l_cut, NUM_NEIGHBORS)
+        score, att_score = tgan.forward(cas_l_cut, src_l_cut, dst_l_cut, ts_l_cut, e_l_cut, NUM_NEIGHBORS)
+        if epoch == NUM_EPOCH-1 and cas_l_cut.shape[0] == 99:
+            utils.plot_graph(k, src_l_cut, dst_l_cut, att_score)
         label = label_l_cut[0] - max(e_l_cut)
         label = np.log2(label + 1)
         batch_score.append(score)
@@ -300,15 +292,15 @@ for epoch in range(NUM_EPOCH):
     test_loss, MSLE, SMAPE, R2 = eval_one_epoch(test_cas_num, cas_dict, test_s_idx, test_e_idx, tgan, test_cas_l, test_src_l, test_dst_l, test_ts_l, test_e_l, test_label_l)
     scheduler.step()
     logger.info('end {} epoch, train loss is {}, test loss is {}, MSLE is {}, SMAPE is {}, R2 is {}'.format(epoch, train_loss, test_loss, MSLE, SMAPE, R2))
-    wandb.log(
-            (
-                {
-                    "train_loss": train_loss,
-                    "test_loss": test_loss,
-                    "MSLE": MSLE,
-                    "SMAPE": SMAPE,
-                    "r2": R2
-                }
-            )
-       )
+    # wandb.log(
+    #         (
+    #             {
+    #                 "train_loss": train_loss,
+    #                 "test_loss": test_loss,
+    #                 "MSLE": MSLE,
+    #                 "SMAPE": SMAPE,
+    #                 "r2": R2
+    #             }
+    #         )
+    #    )
     
